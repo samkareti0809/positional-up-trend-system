@@ -2,6 +2,7 @@ import os
 import datetime
 import sqlite3
 import pandas as pd
+import numpy as np
 import requests
 import yfinance as yf
 import warnings
@@ -16,9 +17,9 @@ DB_NAME = "master_nse_warehouse.db"
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-MAX_HISTORY_DAYS = 350             # Rolling window preserved per ticker
-MIN_DAILY_TURNOVER_INR = 30000000  # Lowered floor to 3 Cr during pullbacks
-STOP_LOSS_PCT = 0.08               # 8% hard stop loss
+MAX_HISTORY_DAYS = 350             
+MIN_DAILY_TURNOVER_INR = 30000000  
+STOP_LOSS_PCT = 0.08               
 
 def send_telegram_alert(message: str):
     """Dispatches formatted message to Telegram."""
@@ -65,7 +66,6 @@ nifty_ema50 = float(latest_nifty["EMA_50"])
 nifty_sma200 = float(latest_nifty["SMA_200"])
 nifty_roc20 = float(latest_nifty["ROC_20"])
 
-# Relaxed Macro Shield Logic
 is_macro_bull = (nifty_close > nifty_ema50) or (nifty_close >= (nifty_sma200 * 0.98))
 
 print(f"Nifty 50: {nifty_close:.2f} | 50 EMA: {nifty_ema50:.2f} | 200 SMA: {nifty_sma200:.2f}")
@@ -83,6 +83,10 @@ actionable_signals = []
 radar_watchlist = []
 bear_rs_watchlist = []
 
+processed_count = 0
+error_count = 0
+skipped_liquidity_count = 0
+
 print(f"Syncing daily data and evaluating {len(tables)} stocks...")
 
 for table in tables:
@@ -97,7 +101,6 @@ for table in tables:
         df.sort_values(by=date_col, ascending=True, inplace=True)
         last_cached_date = df[date_col].iloc[-1]
 
-        # Download missing data if DB is behind today's date
         if last_cached_date.date() < datetime.date.today():
             start_date = (last_cached_date + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
             new_data = yf.download(ticker, start=start_date, progress=False, auto_adjust=False)
@@ -126,23 +129,22 @@ for table in tables:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
         df.dropna(subset=["Close", "Volume"], inplace=True)
 
-        # Baseline check: 65 trading days minimum (~3 months for ROC and trends)
         if len(df) < 65:
             continue
 
         # Liquidity Check
         df["Turnover"] = df["Close"] * df["Volume"]
         if df["Turnover"].tail(30).mean() < MIN_DAILY_TURNOVER_INR:
+            skipped_liquidity_count += 1
             continue
 
-        # Indicator Calculations
+        # Indicator Calculations (Fixed with np.nan to prevent silent math errors)
         df["EMA_50"] = df["Close"].ewm(span=50, adjust=False).mean()
         df["EMA_50_Slope"] = df["EMA_50"] - df["EMA_50"].shift(20)
         df["SMA_200"] = df["Close"].rolling(window=200, min_periods=60).mean()
         df["ROC_3M"] = df["Close"].pct_change(63).fillna(0) * 100
         df["ROC_20"] = df["Close"].pct_change(20).fillna(0) * 100
         
-        # Lookbacks with flexible min_periods
         df["High_52W"] = df["High"].rolling(window=252, min_periods=60).max()
         df["Low_52W"] = df["Low"].rolling(window=252, min_periods=60).min()
         df["Rolling_Low_90"] = df["Low"].rolling(window=90, min_periods=30).min()
@@ -153,15 +155,19 @@ for table in tables:
         df["EMA_Distance_Pct"] = (abs(df["Close"] - df["EMA_50"]) / df["EMA_50"]) * 100
         
         high_low_diff = df["High"] - df["Low"]
-        df["DCR"] = ((df["Close"] - df["Low"]) / high_low_diff.replace(0, pd.NA)).fillna(50) * 100
+        # using np.nan instead of pd.NA
+        df["DCR"] = ((df["Close"] - df["Low"]) / high_low_diff.replace(0, np.nan)).fillna(0.5) * 100
         df["Vol_SMA_20"] = df["Volume"].rolling(window=20, min_periods=10).mean()
-        df["Vol_Ratio"] = df["Volume"] / df["Vol_SMA_20"].replace(0, pd.NA)
+        df["Vol_Ratio"] = df["Volume"] / df["Vol_SMA_20"].replace(0, np.nan)
         df["SMA_200_Slope"] = df["SMA_200"] - df["SMA_200"].shift(20)
 
         df["Bull_Aligned"] = (df["EMA_50"] > df["SMA_200"]).astype(int)
         df["Bull_Trend_Days"] = df.groupby((df["Bull_Aligned"] != df["Bull_Aligned"].shift()).cumsum())["Bull_Aligned"].cumsum()
 
         curr = df.iloc[-1]
+        
+        # Track successful calculation
+        processed_count += 1
 
         # =====================================================================
         # SCENARIO A: BULL REGIME (Active Long Trades)
@@ -221,7 +227,9 @@ for table in tables:
                     "dist_high": dist_high_val,
                 })
 
-    except Exception:
+    except Exception as e:
+        error_count += 1
+        print(f"Error processing {ticker}: {e}")
         continue
 
 conn.close()
@@ -229,7 +237,8 @@ conn.close()
 # =====================================================================
 # 3. CONSTRUCT TELEGRAM DISPATCH
 # =====================================================================
-msg_lines = [f"**🎯 DAILY SYSTEM SCANNER REPORT ({today_str})**", ""]
+msg_lines = [f"**🎯 DAILY SYSTEM SCANNER REPORT ({today_str})**"]
+msg_lines.append(f"*Diag: {len(tables)} DB Tables | {processed_count} Evaluated | {skipped_liquidity_count} Low Liq | {error_count} Errors*\n")
 
 if is_macro_bull:
     msg_lines.append(f"**Macro Regime:** 🟢 BULLISH (Nifty: {nifty_close:.1f} | 20D ROC: {nifty_roc20:.1f}%)")
