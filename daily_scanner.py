@@ -216,8 +216,8 @@ for table in tables:
         else:
             # --- TIER 3: BEAR MARKET RELATIVE STRENGTH ---
             cond_holding_200 = curr["Close"] > curr["SMA_200"]
-            cond_strong_rs = curr["ROC_20"] > (nifty_roc20 + 5.0) # Beating Nifty by > 5% over 20 days
-            cond_resilient = curr["Distance_From_High"] <= 0.20   # Hasn't crashed > 20%
+            cond_strong_rs = curr["ROC_20"] > (nifty_roc20 + 3.0) # Relaxed to +3% outperformance
+            cond_resilient = curr["Distance_From_High"] <= 0.30   # Relaxed to allow 30% corrections
             
             if cond_holding_200 and cond_strong_rs and cond_resilient:
                 bear_rs_watchlist.append({
