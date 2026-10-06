@@ -216,20 +216,9 @@ for table in tables:
         # SCENARIO B: BEAR REGIME (Study Only)
         # =====================================================================
         else:
-            # --- TIER 3: EXTREME WASHOUT RS HUNTER ---
-            # Bypassing the strict rules in the "Prior Uptrend " file (like holding 200 SMA) 
-            # to hunt for extreme relative strength anomalies during a crash.
-            
-            # 1. Defying Gravity: Stock is flat or green over the last 20 days (>-2.0%)
-            cond_defying_gravity = curr["ROC_20"] > -2.0 
-            
-            # 2. Massive Outperformance: Beating the crashing Nifty by at least 8%
-            cond_massive_rs = curr["ROC_20"] > (nifty_roc20 + 8.0)
-            
-            # 3. Crash Survival: Has not dropped more than 35% from its 52-week high
-            cond_surviving = curr["Distance_From_High"] <= 0.35
-            
-            if (cond_defying_gravity or cond_massive_rs) and cond_surviving:
+            # --- TIER 3: PURE RS PULSE CHECK ---
+            # Removing ALL structural rules. Just finding the stocks bleeding the least.
+            if not pd.isna(curr["ROC_20"]) and not pd.isna(curr["Distance_From_High"]):
                 bear_rs_watchlist.append({
                     "ticker": ticker,
                     "price": curr["Close"],
@@ -275,18 +264,17 @@ if radar_watchlist and is_macro_bull:
 
 # --- BEAR MARKET OUTPUT (TIER 3) ---
 if not is_macro_bull and bear_rs_watchlist:
-    msg_lines.append("\n**🛡️ EXTREME WASHOUT RS HUNTER (STUDY ONLY):**")
-    msg_lines.append("*Defying gravity & massively outperforming Nifty:*\n")
+    msg_lines.append("\n**🛡️ PURE RS PULSE CHECK (STUDY ONLY):**")
+    msg_lines.append("*Top 15 stocks bleeding the least vs Nifty:*\n")
     
     # Sort by Relative Strength Spread (Highest to Lowest)
     bear_rs_watchlist = sorted(bear_rs_watchlist, key=lambda x: x["rs_spread"], reverse=True)
     
-    for r in bear_rs_watchlist[:15]: # Display top 15 strongest anomalies
+    for r in bear_rs_watchlist[:15]: 
         msg_lines.append(f"• **{r['ticker']}** (₹{r['price']:.2f})")
         msg_lines.append(f"  └ **RS Outperformance:** +{r['rs_spread']:.1f}% | High Gap: -{r['dist_high']:.1f}%")
-
 elif not is_macro_bull:
-    msg_lines.append("\n**🛡️ EXTREME WASHOUT RS HUNTER:** None found. Absolute market washout.")
+    msg_lines.append("\n**🛡️ PURE RS PULSE CHECK:** No data available.")
 
 final_message = "\n".join(msg_lines)
 send_telegram_alert(final_message)
