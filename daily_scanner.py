@@ -6,7 +6,7 @@ import requests
 import yfinance as yf
 import warnings
 
-# Suppress yfinance warnings for cleaner logs
+# Suppress warnings for cleaner logs
 warnings.filterwarnings("ignore")
 
 # =====================================================================
@@ -17,7 +17,7 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 MAX_HISTORY_DAYS = 350             # Rolling window preserved per ticker
-MIN_DAILY_TURNOVER_INR = 50000000  # 5 Crore INR liquidity floor
+MIN_DAILY_TURNOVER_INR = 30000000  # Lowered floor to 3 Cr during pullbacks
 STOP_LOSS_PCT = 0.08               # 8% hard stop loss
 
 def send_telegram_alert(message: str):
@@ -56,7 +56,7 @@ nifty_raw.columns = [str(c).strip() for c in nifty_raw.columns]
 nifty_raw.dropna(subset=["Close"], inplace=True)
 
 nifty_raw["EMA_50"] = nifty_raw["Close"].ewm(span=50, adjust=False).mean()
-nifty_raw["SMA_200"] = nifty_raw["Close"].rolling(200).mean()
+nifty_raw["SMA_200"] = nifty_raw["Close"].rolling(200, min_periods=100).mean()
 nifty_raw["ROC_20"] = nifty_raw["Close"].pct_change(20) * 100
 
 latest_nifty = nifty_raw.iloc[-1]
@@ -88,7 +88,6 @@ print(f"Syncing daily data and evaluating {len(tables)} stocks...")
 for table in tables:
     ticker = table.replace("stock_", "").replace("_NS", ".NS")
     try:
-        # Load cached historical data
         df = pd.read_sql(f"SELECT * FROM {table} ORDER BY rowid DESC LIMIT {MAX_HISTORY_DAYS}", conn)
         if df.empty:
             continue
@@ -109,11 +108,9 @@ for table in tables:
                 new_data.reset_index(inplace=True)
                 new_data["Date"] = pd.to_datetime(new_data["Date"]).dt.normalize()
 
-                # Append to SQLite DB
                 new_data.to_sql(table, conn, if_exists="append", index=False)
                 df = pd.concat([df, new_data], ignore_index=True)
 
-                # Truncate rolling database to max history
                 conn.execute(f"""
                     DELETE FROM {table} 
                     WHERE rowid NOT IN (
@@ -122,7 +119,6 @@ for table in tables:
                 """)
                 conn.commit()
 
-        # Format dataframe for calculations
         df.set_index(date_col, inplace=True)
         df.sort_index(inplace=True)
         for col in ["Open", "High", "Low", "Close", "Volume"]:
@@ -130,51 +126,50 @@ for table in tables:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
         df.dropna(subset=["Close", "Volume"], inplace=True)
 
-        if len(df) < 200:
+        # Baseline check: 65 trading days minimum (~3 months for ROC and trends)
+        if len(df) < 65:
             continue
 
-        # Liquidity Filter
+        # Liquidity Check
         df["Turnover"] = df["Close"] * df["Volume"]
         if df["Turnover"].tail(30).mean() < MIN_DAILY_TURNOVER_INR:
             continue
 
-        # --- INDICATOR CALCULATIONS (with min_periods fixes) ---
+        # Indicator Calculations
         df["EMA_50"] = df["Close"].ewm(span=50, adjust=False).mean()
         df["EMA_50_Slope"] = df["EMA_50"] - df["EMA_50"].shift(20)
-        df["SMA_200"] = df["Close"].rolling(window=200).mean()
-        df["ROC_3M"] = df["Close"].pct_change(63) * 100
-        df["ROC_20"] = df["Close"].pct_change(20) * 100
+        df["SMA_200"] = df["Close"].rolling(window=200, min_periods=60).mean()
+        df["ROC_3M"] = df["Close"].pct_change(63).fillna(0) * 100
+        df["ROC_20"] = df["Close"].pct_change(20).fillna(0) * 100
         
-        # FIX: min_periods ensures it calculates even if DB only has ~250 days
-        df["High_52W"] = df["High"].rolling(window=252, min_periods=200).max()
-        df["Low_52W"] = df["Low"].rolling(window=252, min_periods=200).min()
-        df["Rolling_Low_90"] = df["Low"].rolling(window=90, min_periods=80).min()
+        # Lookbacks with flexible min_periods
+        df["High_52W"] = df["High"].rolling(window=252, min_periods=60).max()
+        df["Low_52W"] = df["Low"].rolling(window=252, min_periods=60).min()
+        df["Rolling_Low_90"] = df["Low"].rolling(window=90, min_periods=30).min()
         
         df["Distance_From_High"] = (df["High_52W"] - df["Close"]) / df["High_52W"]
         df["Distance_From_Low_52W"] = (df["Close"] - df["Low_52W"]) / df["Low_52W"]
         df["Gain_From_Low_90"] = (df["Close"] - df["Rolling_Low_90"]) / df["Rolling_Low_90"]
         df["EMA_Distance_Pct"] = (abs(df["Close"] - df["EMA_50"]) / df["EMA_50"]) * 100
-        df["DCR"] = ((df["Close"] - df["Low"]) / (df["High"] - df["Low"])) * 100
-        df["Vol_SMA_20"] = df["Volume"].rolling(window=20).mean()
-        df["Vol_Ratio"] = df["Volume"] / df["Vol_SMA_20"]
+        
+        high_low_diff = df["High"] - df["Low"]
+        df["DCR"] = ((df["Close"] - df["Low"]) / high_low_diff.replace(0, pd.NA)).fillna(50) * 100
+        df["Vol_SMA_20"] = df["Volume"].rolling(window=20, min_periods=10).mean()
+        df["Vol_Ratio"] = df["Volume"] / df["Vol_SMA_20"].replace(0, pd.NA)
         df["SMA_200_Slope"] = df["SMA_200"] - df["SMA_200"].shift(20)
 
-        # Prior Uptrend Maturity Tracker
         df["Bull_Aligned"] = (df["EMA_50"] > df["SMA_200"]).astype(int)
         df["Bull_Trend_Days"] = df.groupby((df["Bull_Aligned"] != df["Bull_Aligned"].shift()).cumsum())["Bull_Aligned"].cumsum()
 
         curr = df.iloc[-1]
 
         # =====================================================================
-        # SCENARIO A: BULL REGIME (Active Trading)
+        # SCENARIO A: BULL REGIME (Active Long Trades)
         # =====================================================================
-        if is_macro_bull:
+        if is_macro_bull and len(df) >= 200:
             cond_trend = (curr["Close"] > curr["EMA_50"]) and (curr["EMA_50"] > curr["SMA_200"])
             cond_slope = curr["EMA_50_Slope"] > 0
-            
-            # Strict integration of the "Prior Uptrend" file rules
             cond_prior_uptrend = (curr["SMA_200_Slope"] > 0) and (curr["Distance_From_Low_52W"] >= 0.30) and (curr["Bull_Trend_Days"] >= 20)
-            
             cond_rs = curr["ROC_20"] > nifty_roc20
             cond_mom = curr["ROC_3M"] >= 35.0
             cond_90d_bounce = curr["Gain_From_Low_90"] > 0.40
@@ -182,7 +177,6 @@ for table in tables:
             if not (cond_trend and cond_slope and cond_prior_uptrend and cond_rs and cond_mom and cond_90d_bounce):
                 continue
 
-            # --- TIER 1: ACTIONABLE BREAKOUT SIGNAL ---
             cond_highs = curr["Distance_From_High"] <= 0.18
             cond_comp = (curr["EMA_Distance_Pct"] <= 7.0) or (curr["ROC_3M"] >= 80.0)
             cond_dcr = curr["DCR"] >= 75.0
@@ -201,7 +195,6 @@ for table in tables:
                 })
                 continue
 
-            # --- TIER 2: RADAR WATCHLIST (NEAR THRESHOLD) ---
             cond_radar_proximity = (curr["Distance_From_High"] <= 0.08) and (curr["EMA_Distance_Pct"] <= 10.0)
             cond_radar_activity = (curr["Vol_Ratio"] >= 1.2) or (curr["DCR"] >= 65.0)
 
@@ -216,17 +209,16 @@ for table in tables:
                 })
 
         # =====================================================================
-        # SCENARIO B: BEAR REGIME (Study Only)
+        # SCENARIO B: BEAR REGIME (Study Only - Pure RS Pulse Check)
         # =====================================================================
         else:
-            # --- TIER 3: PURE RS PULSE CHECK ---
-            # Removing ALL structural rules. Just finding the stocks bleeding the least.
-            if not pd.isna(curr["ROC_20"]) and not pd.isna(curr["Distance_From_High"]):
+            if not pd.isna(curr["ROC_20"]):
+                dist_high_val = curr["Distance_From_High"] * 100 if not pd.isna(curr["Distance_From_High"]) else 0.0
                 bear_rs_watchlist.append({
                     "ticker": ticker,
                     "price": curr["Close"],
                     "rs_spread": curr["ROC_20"] - nifty_roc20,
-                    "dist_high": curr["Distance_From_High"] * 100,
+                    "dist_high": dist_high_val,
                 })
 
     except Exception:
@@ -247,7 +239,6 @@ else:
 
 msg_lines.append("=" * 35)
 
-# --- BULL MARKET OUTPUT (TIERS 1 & 2) ---
 if actionable_signals and is_macro_bull:
     msg_lines.append("\n**🚀 ACTIONABLE TRANCHE-1 PROBES:**")
     msg_lines.append("*Allocation: 33% of 25% Position | Stop-Loss: 8%*\n")
@@ -265,12 +256,10 @@ if radar_watchlist and is_macro_bull:
     for r in radar_watchlist[:8]:
         msg_lines.append(f"• **{r['ticker']}** (₹{r['price']:.2f}) | High Gap: -{r['dist_high']:.1f}% | Vol: {r['vol_ratio']:.1f}x | DCR: {r['dcr']:.0f}%")
 
-# --- BEAR MARKET OUTPUT (TIER 3) ---
 if not is_macro_bull and bear_rs_watchlist:
-    msg_lines.append("\n**🛡️️ PURE RS PULSE CHECK (STUDY ONLY):**")
-    msg_lines.append("*Top 15 stocks bleeding the least vs Nifty:*\n")
+    msg_lines.append("\n**🛡️ PURE RS PULSE CHECK (STUDY ONLY):**")
+    msg_lines.append("*Top 15 stocks showing relative strength vs Nifty:*\n")
     
-    # Sort by Relative Strength Spread (Highest to Lowest)
     bear_rs_watchlist = sorted(bear_rs_watchlist, key=lambda x: x["rs_spread"], reverse=True)
     
     for r in bear_rs_watchlist[:15]: 
