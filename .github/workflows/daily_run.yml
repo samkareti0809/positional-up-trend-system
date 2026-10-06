@@ -31,12 +31,16 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python daily_scanner.py
-
-      - name: Commit Updated Database
-        run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add master_nse_warehouse.db
-          # Only commit if the database actually changed
-          git diff --quiet && git diff --staged --quiet || git commit -m "Auto-update daily market data"
-          git push
+          
+       - name: Commit Updated Database
+         run: |
+                    git config --global user.name "github-actions[bot]"
+                    git config --global user.email "github-actions[bot]@users.noreply.github.com"
+                    git add master_nse_warehouse.db
+                    # Only commit if the database actually changed
+                    git diff --quiet && git diff --staged --quiet || git commit -m "Auto-update daily market data"
+                    
+                    # Pull any recent web edits so we don't get rejected
+                    git pull --rebase origin main
+                    
+                    git push
