@@ -130,7 +130,7 @@ for table in tables:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
         df.dropna(subset=["Close", "Volume"], inplace=True)
 
-        if len(df) < 250:
+        if len(df) < 200:
             continue
 
         # Liquidity Filter
@@ -138,17 +138,20 @@ for table in tables:
         if df["Turnover"].tail(30).mean() < MIN_DAILY_TURNOVER_INR:
             continue
 
-        # --- INDICATOR CALCULATIONS ---
+        # --- INDICATOR CALCULATIONS (with min_periods fixes) ---
         df["EMA_50"] = df["Close"].ewm(span=50, adjust=False).mean()
         df["EMA_50_Slope"] = df["EMA_50"] - df["EMA_50"].shift(20)
         df["SMA_200"] = df["Close"].rolling(window=200).mean()
         df["ROC_3M"] = df["Close"].pct_change(63) * 100
         df["ROC_20"] = df["Close"].pct_change(20) * 100
-        df["High_52W"] = df["High"].rolling(window=252).max()
-        df["Low_52W"] = df["Low"].rolling(window=252).min()
+        
+        # FIX: min_periods ensures it calculates even if DB only has ~250 days
+        df["High_52W"] = df["High"].rolling(window=252, min_periods=200).max()
+        df["Low_52W"] = df["Low"].rolling(window=252, min_periods=200).min()
+        df["Rolling_Low_90"] = df["Low"].rolling(window=90, min_periods=80).min()
+        
         df["Distance_From_High"] = (df["High_52W"] - df["Close"]) / df["High_52W"]
         df["Distance_From_Low_52W"] = (df["Close"] - df["Low_52W"]) / df["Low_52W"]
-        df["Rolling_Low_90"] = df["Low"].rolling(window=90).min()
         df["Gain_From_Low_90"] = (df["Close"] - df["Rolling_Low_90"]) / df["Rolling_Low_90"]
         df["EMA_Distance_Pct"] = (abs(df["Close"] - df["EMA_50"]) / df["EMA_50"]) * 100
         df["DCR"] = ((df["Close"] - df["Low"]) / (df["High"] - df["Low"])) * 100
@@ -169,7 +172,7 @@ for table in tables:
             cond_trend = (curr["Close"] > curr["EMA_50"]) and (curr["EMA_50"] > curr["SMA_200"])
             cond_slope = curr["EMA_50_Slope"] > 0
             
-            # Strict integration of the "Prior Uptrend " file rules
+            # Strict integration of the "Prior Uptrend" file rules
             cond_prior_uptrend = (curr["SMA_200_Slope"] > 0) and (curr["Distance_From_Low_52W"] >= 0.30) and (curr["Bull_Trend_Days"] >= 20)
             
             cond_rs = curr["ROC_20"] > nifty_roc20
@@ -264,7 +267,7 @@ if radar_watchlist and is_macro_bull:
 
 # --- BEAR MARKET OUTPUT (TIER 3) ---
 if not is_macro_bull and bear_rs_watchlist:
-    msg_lines.append("\n**🛡️ PURE RS PULSE CHECK (STUDY ONLY):**")
+    msg_lines.append("\n**🛡️️ PURE RS PULSE CHECK (STUDY ONLY):**")
     msg_lines.append("*Top 15 stocks bleeding the least vs Nifty:*\n")
     
     # Sort by Relative Strength Spread (Highest to Lowest)
