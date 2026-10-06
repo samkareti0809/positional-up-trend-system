@@ -168,8 +168,10 @@ for table in tables:
         if is_macro_bull:
             cond_trend = (curr["Close"] > curr["EMA_50"]) and (curr["EMA_50"] > curr["SMA_200"])
             cond_slope = curr["EMA_50_Slope"] > 0
+            
             # Strict integration of the "Prior Uptrend " file rules
             cond_prior_uptrend = (curr["SMA_200_Slope"] > 0) and (curr["Distance_From_Low_52W"] >= 0.30) and (curr["Bull_Trend_Days"] >= 20)
+            
             cond_rs = curr["ROC_20"] > nifty_roc20
             cond_mom = curr["ROC_3M"] >= 35.0
             cond_90d_bounce = curr["Gain_From_Low_90"] > 0.40
@@ -214,12 +216,20 @@ for table in tables:
         # SCENARIO B: BEAR REGIME (Study Only)
         # =====================================================================
         else:
-            # --- TIER 3: BEAR MARKET RELATIVE STRENGTH ---
-            cond_holding_200 = curr["Close"] > curr["SMA_200"]
-            cond_strong_rs = curr["ROC_20"] > (nifty_roc20 + 3.0) # Relaxed to +3% outperformance
-            cond_resilient = curr["Distance_From_High"] <= 0.30   # Relaxed to allow 30% corrections
+            # --- TIER 3: EXTREME WASHOUT RS HUNTER ---
+            # Bypassing the strict rules in the "Prior Uptrend " file (like holding 200 SMA) 
+            # to hunt for extreme relative strength anomalies during a crash.
             
-            if cond_holding_200 and cond_strong_rs and cond_resilient:
+            # 1. Defying Gravity: Stock is flat or green over the last 20 days (>-2.0%)
+            cond_defying_gravity = curr["ROC_20"] > -2.0 
+            
+            # 2. Massive Outperformance: Beating the crashing Nifty by at least 8%
+            cond_massive_rs = curr["ROC_20"] > (nifty_roc20 + 8.0)
+            
+            # 3. Crash Survival: Has not dropped more than 35% from its 52-week high
+            cond_surviving = curr["Distance_From_High"] <= 0.35
+            
+            if (cond_defying_gravity or cond_massive_rs) and cond_surviving:
                 bear_rs_watchlist.append({
                     "ticker": ticker,
                     "price": curr["Close"],
@@ -241,7 +251,7 @@ if is_macro_bull:
     msg_lines.append(f"**Macro Regime:** 🟢 BULLISH (Nifty: {nifty_close:.1f} | 20D ROC: {nifty_roc20:.1f}%)")
 else:
     msg_lines.append(f"**Macro Regime:** 🔴 BEARISH / CAUTION (Nifty: {nifty_close:.1f})")
-    msg_lines.append("**⚠️ MACRO SHIELD DOWN:** Standard setups blocked. Displaying Relative Strength leaders for study.")
+    msg_lines.append("**⚠️ MACRO SHIELD DOWN:** Standard setups blocked. Hunting Extreme RS Anomalies for study.")
 
 msg_lines.append("=" * 35)
 
@@ -265,18 +275,18 @@ if radar_watchlist and is_macro_bull:
 
 # --- BEAR MARKET OUTPUT (TIER 3) ---
 if not is_macro_bull and bear_rs_watchlist:
-    msg_lines.append("\n**🛡️ BEAR MARKET RS LEADERS (STUDY ONLY):**")
-    msg_lines.append("*Stocks holding 200 SMA and heavily outperforming the Nifty:*\n")
+    msg_lines.append("\n**🛡️ EXTREME WASHOUT RS HUNTER (STUDY ONLY):**")
+    msg_lines.append("*Defying gravity & massively outperforming Nifty:*\n")
     
     # Sort by Relative Strength Spread (Highest to Lowest)
     bear_rs_watchlist = sorted(bear_rs_watchlist, key=lambda x: x["rs_spread"], reverse=True)
     
-    for r in bear_rs_watchlist[:10]: # Display top 10 strongest stocks
+    for r in bear_rs_watchlist[:15]: # Display top 15 strongest anomalies
         msg_lines.append(f"• **{r['ticker']}** (₹{r['price']:.2f})")
         msg_lines.append(f"  └ **RS Outperformance:** +{r['rs_spread']:.1f}% | High Gap: -{r['dist_high']:.1f}%")
 
 elif not is_macro_bull:
-    msg_lines.append("\n**🛡️ BEAR MARKET RS LEADERS:** None found. Total market washout.")
+    msg_lines.append("\n**🛡️ EXTREME WASHOUT RS HUNTER:** None found. Absolute market washout.")
 
 final_message = "\n".join(msg_lines)
 send_telegram_alert(final_message)
