@@ -6,6 +6,7 @@ import numpy as np
 import requests
 import yfinance as yf
 import warnings
+import io
 
 # Suppress warnings for cleaner logs
 warnings.filterwarnings("ignore")
@@ -20,7 +21,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 MAX_HISTORY_DAYS = 350             
 MIN_DAILY_TURNOVER_INR = 30000000  
 STOP_LOSS_PCT = 0.08               
-BATCH_SIZE = 200 # Multi-threading batch size
+BATCH_SIZE = 200 
 
 def send_telegram_alert(message: str):
     """Dispatches formatted message to Telegram."""
@@ -37,18 +38,13 @@ def send_telegram_alert(message: str):
         "disable_web_page_preview": True,
     }
     try:
-        resp = requests.post(url, json=payload, timeout=10)
-        if resp.status_code == 200:
-            print("Telegram notification sent successfully.")
-        else:
-            print(f"Telegram dispatch failed: {resp.text}")
+        requests.post(url, json=payload, timeout=10)
     except Exception as e:
         print(f"Error sending Telegram alert: {e}")
 
 # =====================================================================
 # 1. MACRO BENCHMARK & REGIME CHECK
 # =====================================================================
-print("Fetching Nifty 50 for Regime and Relative Strength calculation...")
 today_str = datetime.date.today().strftime("%Y-%m-%d")
 nifty_raw = yf.download("^NSEI", period="1y", interval="1d", progress=False, auto_adjust=False)
 
@@ -69,38 +65,40 @@ nifty_roc20 = float(latest_nifty["ROC_20"])
 
 is_macro_bull = (nifty_close > nifty_ema50) or (nifty_close >= (nifty_sma200 * 0.98))
 
-print(f"Nifty 50: {nifty_close:.2f} | 50 EMA: {nifty_ema50:.2f} | 200 SMA: {nifty_sma200:.2f}")
-print(f"Macro Shield Status: {'BULLISH (ACTIVE)' if is_macro_bull else 'BEARISH (WARNING)'}")
-
 # =====================================================================
-# 2. DATABASE CONNECTION & ON-THE-GO BOOTSTRAP
+# 2. DATABASE CONNECTION & GHOST FETCH BOOTSTRAP
 # =====================================================================
 conn = sqlite3.connect(DB_NAME)
 cursor = conn.cursor()
 cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'stock_%';")
 tables = [row[0] for row in cursor.fetchall()]
 
-# --- DYNAMIC BOOTSTRAP: If DB is empty, read seed file and build it ---
+bootstrap_log = ""
+
+# --- DYNAMIC BOOTSTRAP ---
 if len(tables) == 0:
-    print("Empty database detected! Initiating On-The-Go Bootstrap Protocol...")
-    if os.path.exists("EQUITY_L.csv"):
-        df_sym = pd.read_csv("EQUITY_L.csv")
-        tickers = [f"{sym}.NS" for sym in df_sym['SYMBOL']]
-        print(f"Found {len(tickers)} stocks in EQUITY_L.csv. Downloading 1-year history in batches. This will take ~2 minutes...")
+    bootstrap_log += "\n<b>⚙️ BOOTSTRAP PROTOCOL TRIGGERED:</b>\n"
+    try:
+        # Ghost Fetcher: Spoof browser headers to bypass NSE firewall
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+        }
+        session = requests.Session()
+        session.get("https://www.nseindia.com", headers=headers, timeout=15) # Acquire NSE cookies
+        resp = session.get("https://archives.nseindia.com/content/equities/EQUITY_L.csv", headers=headers, timeout=15)
         
-        for i in range(0, len(tickers), BATCH_SIZE):
-            batch_tickers = tickers[i:i+BATCH_SIZE]
-            print(f"Bootstrapping Batch {i//BATCH_SIZE + 1} of {(len(tickers)//BATCH_SIZE) + 1}...")
-            try:
-                batch_data = yf.download(
-                    batch_tickers, 
-                    period="1y", 
-                    interval="1d", 
-                    group_by="ticker", 
-                    threads=True, 
-                    progress=False, 
-                    auto_adjust=False
-                )
+        if resp.status_code == 200:
+            df_sym = pd.read_csv(io.StringIO(resp.text))
+            tickers = [f"{sym}.NS" for sym in df_sym['SYMBOL']]
+            bootstrap_log += f"✅ NSE Ticker list acquired ({len(tickers)} stocks).\n"
+            
+            # Download 1-year history in batches
+            bootstrap_log += f"⏳ Downloading YFinance data in batches of {BATCH_SIZE}...\n"
+            for i in range(0, len(tickers), BATCH_SIZE):
+                batch_tickers = tickers[i:i+BATCH_SIZE]
+                batch_data = yf.download(batch_tickers, period="1y", interval="1d", group_by="ticker", threads=True, progress=False, auto_adjust=False)
                 
                 for ticker in batch_tickers:
                     if len(batch_tickers) > 1:
@@ -121,15 +119,15 @@ if len(tables) == 0:
                     table_name = f"stock_{ticker.replace('.NS', '_NS')}"
                     df_new = df_new[["Date", "Open", "High", "Low", "Close", "Volume"]]
                     df_new.to_sql(table_name, conn, if_exists="replace", index=False)
-                    
-            except Exception as e:
-                print(f"Bootstrap batch failed: {e}")
-                
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'stock_%';")
-        tables = [row[0] for row in cursor.fetchall()]
-        print(f"Bootstrap complete! {len(tables)} stocks populated successfully.")
-    else:
-        print("ERROR: EQUITY_L.csv seed file is missing. Please upload it via the GitHub website.")
+            
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'stock_%';")
+            tables = [row[0] for row in cursor.fetchall()]
+            bootstrap_log += f"✅ Database successfully built with {len(tables)} tables!\n"
+        else:
+            bootstrap_log += f"❌ NSE Firewall Blocked Fetch (Status Code: {resp.status_code}).\n"
+            
+    except Exception as e:
+        bootstrap_log += f"❌ Bootstrap Failed Error: {str(e)}\n"
 
 # =====================================================================
 # 3. BATCH DATA SYNC & SYSTEM SCANNER
@@ -142,32 +140,18 @@ processed_count = 0
 error_count = 0
 skipped_liquidity_count = 0
 
-if len(tables) > 0:
-    print(f"\nInitiating daily scanner for {len(tables)} stocks...")
-
 for i in range(0, len(tables), BATCH_SIZE):
     batch_tables = tables[i:i + BATCH_SIZE]
     batch_tickers = [t.replace("stock_", "").replace("_NS", ".NS") for t in batch_tables]
     
-    # Fetch latest 7 days for the batch instantly
     try:
-        batch_data = yf.download(
-            batch_tickers, 
-            period="7d", 
-            interval="1d", 
-            group_by="ticker", 
-            threads=True, 
-            progress=False, 
-            auto_adjust=False
-        )
+        batch_data = yf.download(batch_tickers, period="7d", interval="1d", group_by="ticker", threads=True, progress=False, auto_adjust=False)
     except Exception:
         error_count += len(batch_tickers)
         continue
 
-    # Update Database and Run Scan per Ticker
     for table, ticker in zip(batch_tables, batch_tickers):
         try:
-            # --- UPDATE INCREMENTAL DATA ---
             if len(batch_tickers) > 1:
                 if ticker not in batch_data.columns.get_level_values(0): continue
                 df_new = batch_data[ticker].copy()
@@ -193,7 +177,6 @@ for i in range(0, len(tables), BATCH_SIZE):
                     df_new = df_new[["Date", "Open", "High", "Low", "Close", "Volume"]]
                     df_new.to_sql(table, conn, if_exists="append", index=False)
             
-            # Truncate rolling database to max history
             conn.execute(f"""
                 DELETE FROM {table} 
                 WHERE rowid NOT IN (
@@ -202,10 +185,8 @@ for i in range(0, len(tables), BATCH_SIZE):
             """)
             conn.commit()
 
-            # --- LOAD CACHE & RUN SCANNER LOGIC ---
             df = pd.read_sql(f"SELECT * FROM {table} ORDER BY Date ASC", conn)
-            if df.empty:
-                continue
+            if df.empty: continue
 
             df["Date"] = pd.to_datetime(df["Date"]).dt.normalize()
             df.set_index("Date", inplace=True)
@@ -214,15 +195,13 @@ for i in range(0, len(tables), BATCH_SIZE):
                     df[col] = pd.to_numeric(df[col], errors="coerce")
             df.dropna(subset=["Close", "Volume"], inplace=True)
 
-            if len(df) < 65:
-                continue
+            if len(df) < 65: continue
 
             df["Turnover"] = df["Close"] * df["Volume"]
             if df["Turnover"].tail(30).mean() < MIN_DAILY_TURNOVER_INR:
                 skipped_liquidity_count += 1
                 continue
 
-            # Indicators 
             df["EMA_50"] = df["Close"].ewm(span=50, adjust=False).mean()
             df["EMA_50_Slope"] = df["EMA_50"] - df["EMA_50"].shift(20)
             df["SMA_200"] = df["Close"].rolling(window=200, min_periods=60).mean()
@@ -250,14 +229,11 @@ for i in range(0, len(tables), BATCH_SIZE):
             curr = df.iloc[-1]
             processed_count += 1
 
-            # =====================================================================
-            # SCENARIO A: BULL REGIME (Active Long Trades)
-            # =====================================================================
             if is_macro_bull and len(df) >= 200:
                 cond_trend = (curr["Close"] > curr["EMA_50"]) and (curr["EMA_50"] > curr["SMA_200"])
                 cond_slope = curr["EMA_50_Slope"] > 0
                 
-                # Strict structural rules integrated directly from "Prior Uptrend " file
+                # Applying structural rules from the "Prior Uptrend " file
                 cond_prior_uptrend = (curr["SMA_200_Slope"] > 0) and (curr["Distance_From_Low_52W"] >= 0.30) and (curr["Bull_Trend_Days"] >= 20)
                 
                 cond_rs = curr["ROC_20"] > nifty_roc20
@@ -297,10 +273,6 @@ for i in range(0, len(tables), BATCH_SIZE):
                         "dist_high": curr["Distance_From_High"] * 100,
                         "roc_3m": curr["ROC_3M"],
                     })
-
-            # =====================================================================
-            # SCENARIO B: BEAR REGIME (Study Only - Pure RS Pulse Check)
-            # =====================================================================
             else:
                 if not pd.isna(curr["ROC_20"]):
                     dist_high_val = curr["Distance_From_High"] * 100 if not pd.isna(curr["Distance_From_High"]) else 0.0
@@ -313,7 +285,6 @@ for i in range(0, len(tables), BATCH_SIZE):
 
         except Exception as e:
             error_count += 1
-            print(f"Error processing {ticker}: {e}")
             continue
 
 conn.close()
@@ -323,6 +294,9 @@ conn.close()
 # =====================================================================
 msg_lines = [f"<b>🎯 DAILY SYSTEM SCANNER REPORT ({today_str})</b>"]
 msg_lines.append(f"<i>Diag: {len(tables)} DB Tables | {processed_count} Evaluated | {skipped_liquidity_count} Low Liq | {error_count} Errors</i>\n")
+
+if bootstrap_log:
+    msg_lines.append(bootstrap_log)
 
 if is_macro_bull:
     msg_lines.append(f"<b>Macro Regime:</b> 🟢 BULLISH (Nifty: {nifty_close:.1f} | 20D ROC: {nifty_roc20:.1f}%)")
