@@ -20,6 +20,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 MAX_HISTORY_DAYS = 350             
 MIN_DAILY_TURNOVER_INR = 30000000  
 STOP_LOSS_PCT = 0.08               
+BATCH_SIZE = 200 # Defines how many stocks to fetch simultaneously
 
 def send_telegram_alert(message: str):
     """Dispatches formatted message to Telegram."""
@@ -72,7 +73,7 @@ print(f"Nifty 50: {nifty_close:.2f} | 50 EMA: {nifty_ema50:.2f} | 200 SMA: {nift
 print(f"Macro Shield Status: {'BULLISH (ACTIVE)' if is_macro_bull else 'BEARISH (WARNING)'}")
 
 # =====================================================================
-# 2. INCREMENTAL DATA SYNC & SYSTEM SCANNER
+# 2. BATCH DATA SYNC & SYSTEM SCANNER
 # =====================================================================
 conn = sqlite3.connect(DB_NAME)
 cursor = conn.cursor()
@@ -87,195 +88,229 @@ processed_count = 0
 error_count = 0
 skipped_liquidity_count = 0
 
-print(f"Syncing daily data and evaluating {len(tables)} stocks...")
+print(f"Syncing and evaluating {len(tables)} stocks in batches of {BATCH_SIZE}...")
 
-for table in tables:
-    ticker = table.replace("stock_", "").replace("_NS", ".NS")
+for i in range(0, len(tables), BATCH_SIZE):
+    batch_tables = tables[i:i + BATCH_SIZE]
+    batch_tickers = [t.replace("stock_", "").replace("_NS", ".NS") for t in batch_tables]
+    
+    print(f"Processing Batch {i//BATCH_SIZE + 1} of {(len(tables)//BATCH_SIZE) + 1}...")
+    
+    # 2a. Fetch 7 days of rolling data for the entire batch instantly
     try:
-        df = pd.read_sql(f"SELECT * FROM {table} ORDER BY rowid DESC LIMIT {MAX_HISTORY_DAYS}", conn)
-        if df.empty:
-            continue
-
-        date_col = "Date" if "Date" in df.columns else ("index" if "index" in df.columns else df.columns[0])
-        df[date_col] = pd.to_datetime(df[date_col]).dt.normalize()
-        df.sort_values(by=date_col, ascending=True, inplace=True)
-        last_cached_date = df[date_col].iloc[-1]
-
-        if last_cached_date.date() < datetime.date.today():
-            start_date = (last_cached_date + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
-            new_data = yf.download(ticker, start=start_date, progress=False, auto_adjust=False)
-            if not new_data.empty:
-                if isinstance(new_data.columns, pd.MultiIndex):
-                    new_data.columns = new_data.columns.get_level_values(0)
-                new_data.columns = [str(c).strip() for c in new_data.columns]
-                new_data.reset_index(inplace=True)
-                new_data["Date"] = pd.to_datetime(new_data["Date"]).dt.normalize()
-
-                new_data.to_sql(table, conn, if_exists="append", index=False)
-                df = pd.concat([df, new_data], ignore_index=True)
-
-                conn.execute(f"""
-                    DELETE FROM {table} 
-                    WHERE rowid NOT IN (
-                        SELECT rowid FROM {table} ORDER BY rowid DESC LIMIT {MAX_HISTORY_DAYS}
-                    )
-                """)
-                conn.commit()
-
-        df.set_index(date_col, inplace=True)
-        df.sort_index(inplace=True)
-        for col in ["Open", "High", "Low", "Close", "Volume"]:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-        df.dropna(subset=["Close", "Volume"], inplace=True)
-
-        if len(df) < 65:
-            continue
-
-        # Liquidity Check
-        df["Turnover"] = df["Close"] * df["Volume"]
-        if df["Turnover"].tail(30).mean() < MIN_DAILY_TURNOVER_INR:
-            skipped_liquidity_count += 1
-            continue
-
-        # Indicator Calculations (Fixed with np.nan to prevent silent math errors)
-        df["EMA_50"] = df["Close"].ewm(span=50, adjust=False).mean()
-        df["EMA_50_Slope"] = df["EMA_50"] - df["EMA_50"].shift(20)
-        df["SMA_200"] = df["Close"].rolling(window=200, min_periods=60).mean()
-        df["ROC_3M"] = df["Close"].pct_change(63).fillna(0) * 100
-        df["ROC_20"] = df["Close"].pct_change(20).fillna(0) * 100
-        
-        df["High_52W"] = df["High"].rolling(window=252, min_periods=60).max()
-        df["Low_52W"] = df["Low"].rolling(window=252, min_periods=60).min()
-        df["Rolling_Low_90"] = df["Low"].rolling(window=90, min_periods=30).min()
-        
-        df["Distance_From_High"] = (df["High_52W"] - df["Close"]) / df["High_52W"]
-        df["Distance_From_Low_52W"] = (df["Close"] - df["Low_52W"]) / df["Low_52W"]
-        df["Gain_From_Low_90"] = (df["Close"] - df["Rolling_Low_90"]) / df["Rolling_Low_90"]
-        df["EMA_Distance_Pct"] = (abs(df["Close"] - df["EMA_50"]) / df["EMA_50"]) * 100
-        
-        high_low_diff = df["High"] - df["Low"]
-        # using np.nan instead of pd.NA
-        df["DCR"] = ((df["Close"] - df["Low"]) / high_low_diff.replace(0, np.nan)).fillna(0.5) * 100
-        df["Vol_SMA_20"] = df["Volume"].rolling(window=20, min_periods=10).mean()
-        df["Vol_Ratio"] = df["Volume"] / df["Vol_SMA_20"].replace(0, np.nan)
-        df["SMA_200_Slope"] = df["SMA_200"] - df["SMA_200"].shift(20)
-
-        df["Bull_Aligned"] = (df["EMA_50"] > df["SMA_200"]).astype(int)
-        df["Bull_Trend_Days"] = df.groupby((df["Bull_Aligned"] != df["Bull_Aligned"].shift()).cumsum())["Bull_Aligned"].cumsum()
-
-        curr = df.iloc[-1]
-        
-        # Track successful calculation
-        processed_count += 1
-
-        # =====================================================================
-        # SCENARIO A: BULL REGIME (Active Long Trades)
-        # =====================================================================
-        if is_macro_bull and len(df) >= 200:
-            cond_trend = (curr["Close"] > curr["EMA_50"]) and (curr["EMA_50"] > curr["SMA_200"])
-            cond_slope = curr["EMA_50_Slope"] > 0
-            cond_prior_uptrend = (curr["SMA_200_Slope"] > 0) and (curr["Distance_From_Low_52W"] >= 0.30) and (curr["Bull_Trend_Days"] >= 20)
-            cond_rs = curr["ROC_20"] > nifty_roc20
-            cond_mom = curr["ROC_3M"] >= 35.0
-            cond_90d_bounce = curr["Gain_From_Low_90"] > 0.40
-
-            if not (cond_trend and cond_slope and cond_prior_uptrend and cond_rs and cond_mom and cond_90d_bounce):
-                continue
-
-            cond_highs = curr["Distance_From_High"] <= 0.18
-            cond_comp = (curr["EMA_Distance_Pct"] <= 7.0) or (curr["ROC_3M"] >= 80.0)
-            cond_dcr = curr["DCR"] >= 75.0
-            cond_vol = curr["Vol_Ratio"] >= 1.8
-
-            if cond_highs and cond_comp and cond_dcr and cond_vol:
-                actionable_signals.append({
-                    "ticker": ticker,
-                    "price": curr["Close"],
-                    "stop_loss": curr["Close"] * (1 - STOP_LOSS_PCT),
-                    "vol_ratio": curr["Vol_Ratio"],
-                    "dcr": curr["DCR"],
-                    "roc_3m": curr["ROC_3M"],
-                    "rs_spread": curr["ROC_20"] - nifty_roc20,
-                    "dist_high": curr["Distance_From_High"] * 100,
-                })
-                continue
-
-            cond_radar_proximity = (curr["Distance_From_High"] <= 0.08) and (curr["EMA_Distance_Pct"] <= 10.0)
-            cond_radar_activity = (curr["Vol_Ratio"] >= 1.2) or (curr["DCR"] >= 65.0)
-
-            if cond_radar_proximity and cond_radar_activity:
-                radar_watchlist.append({
-                    "ticker": ticker,
-                    "price": curr["Close"],
-                    "vol_ratio": curr["Vol_Ratio"],
-                    "dcr": curr["DCR"],
-                    "dist_high": curr["Distance_From_High"] * 100,
-                    "roc_3m": curr["ROC_3M"],
-                })
-
-        # =====================================================================
-        # SCENARIO B: BEAR REGIME (Study Only - Pure RS Pulse Check)
-        # =====================================================================
-        else:
-            if not pd.isna(curr["ROC_20"]):
-                dist_high_val = curr["Distance_From_High"] * 100 if not pd.isna(curr["Distance_From_High"]) else 0.0
-                bear_rs_watchlist.append({
-                    "ticker": ticker,
-                    "price": curr["Close"],
-                    "rs_spread": curr["ROC_20"] - nifty_roc20,
-                    "dist_high": dist_high_val,
-                })
-
+        batch_data = yf.download(
+            batch_tickers, 
+            period="7d", 
+            interval="1d", 
+            group_by="ticker", 
+            threads=True, 
+            progress=False, 
+            auto_adjust=False
+        )
     except Exception as e:
-        error_count += 1
-        print(f"Error processing {ticker}: {e}")
+        print(f"Batch fetch failed: {e}")
+        error_count += len(batch_tickers)
         continue
+
+    # 2b. Update Database and Run Scan per Ticker in the Batch
+    for table, ticker in zip(batch_tables, batch_tickers):
+        try:
+            # --- EXTRACT BATCH DATA FOR CURRENT TICKER ---
+            if len(batch_tickers) > 1:
+                if ticker not in batch_data.columns.get_level_values(0):
+                    continue
+                df_new = batch_data[ticker].copy()
+            else:
+                df_new = batch_data.copy()
+
+            df_new.dropna(subset=["Close"], inplace=True)
+            
+            if not df_new.empty:
+                df_new.reset_index(inplace=True)
+                date_col = "Date" if "Date" in df_new.columns else df_new.columns[0]
+                df_new["Date"] = pd.to_datetime(df_new[date_col]).dt.normalize()
+                df_new.columns = [str(c).strip() for c in df_new.columns]
+                
+                # Fetch max date directly via SQL to avoid loading full history into memory yet
+                cursor.execute(f"SELECT MAX(Date) FROM {table}")
+                max_date_val = cursor.fetchone()[0]
+                
+                if max_date_val:
+                    max_date = pd.to_datetime(max_date_val).normalize()
+                    df_new = df_new[df_new["Date"] > max_date]
+                
+                # Append missing days
+                if not df_new.empty:
+                    df_new = df_new[["Date", "Open", "High", "Low", "Close", "Volume"]]
+                    df_new.to_sql(table, conn, if_exists="append", index=False)
+            
+            # Keep database lean
+            conn.execute(f"""
+                DELETE FROM {table} 
+                WHERE rowid NOT IN (
+                    SELECT rowid FROM {table} ORDER BY Date DESC LIMIT {MAX_HISTORY_DAYS}
+                )
+            """)
+            conn.commit()
+
+            # --- LOAD FULL CACHE & RUN SCANNER LOGIC ---
+            df = pd.read_sql(f"SELECT * FROM {table} ORDER BY Date ASC", conn)
+            if df.empty:
+                continue
+
+            df["Date"] = pd.to_datetime(df["Date"]).dt.normalize()
+            df.set_index("Date", inplace=True)
+            for col in ["Open", "High", "Low", "Close", "Volume"]:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+            df.dropna(subset=["Close", "Volume"], inplace=True)
+
+            if len(df) < 65:
+                continue
+
+            df["Turnover"] = df["Close"] * df["Volume"]
+            if df["Turnover"].tail(30).mean() < MIN_DAILY_TURNOVER_INR:
+                skipped_liquidity_count += 1
+                continue
+
+            # Indicator Calculations 
+            df["EMA_50"] = df["Close"].ewm(span=50, adjust=False).mean()
+            df["EMA_50_Slope"] = df["EMA_50"] - df["EMA_50"].shift(20)
+            df["SMA_200"] = df["Close"].rolling(window=200, min_periods=60).mean()
+            df["ROC_3M"] = df["Close"].pct_change(63).fillna(0) * 100
+            df["ROC_20"] = df["Close"].pct_change(20).fillna(0) * 100
+            
+            df["High_52W"] = df["High"].rolling(window=252, min_periods=60).max()
+            df["Low_52W"] = df["Low"].rolling(window=252, min_periods=60).min()
+            df["Rolling_Low_90"] = df["Low"].rolling(window=90, min_periods=30).min()
+            
+            df["Distance_From_High"] = (df["High_52W"] - df["Close"]) / df["High_52W"]
+            df["Distance_From_Low_52W"] = (df["Close"] - df["Low_52W"]) / df["Low_52W"]
+            df["Gain_From_Low_90"] = (df["Close"] - df["Rolling_Low_90"]) / df["Rolling_Low_90"]
+            df["EMA_Distance_Pct"] = (abs(df["Close"] - df["EMA_50"]) / df["EMA_50"]) * 100
+            
+            high_low_diff = df["High"] - df["Low"]
+            df["DCR"] = ((df["Close"] - df["Low"]) / high_low_diff.replace(0, np.nan)).fillna(0.5) * 100
+            df["Vol_SMA_20"] = df["Volume"].rolling(window=20, min_periods=10).mean()
+            df["Vol_Ratio"] = df["Volume"] / df["Vol_SMA_20"].replace(0, np.nan)
+            df["SMA_200_Slope"] = df["SMA_200"] - df["SMA_200"].shift(20)
+
+            df["Bull_Aligned"] = (df["EMA_50"] > df["SMA_200"]).astype(int)
+            df["Bull_Trend_Days"] = df.groupby((df["Bull_Aligned"] != df["Bull_Aligned"].shift()).cumsum())["Bull_Aligned"].cumsum()
+
+            curr = df.iloc[-1]
+            processed_count += 1
+
+            # =====================================================================
+            # SCENARIO A: BULL REGIME (Active Long Trades)
+            # =====================================================================
+            if is_macro_bull and len(df) >= 200:
+                cond_trend = (curr["Close"] > curr["EMA_50"]) and (curr["EMA_50"] > curr["SMA_200"])
+                cond_slope = curr["EMA_50_Slope"] > 0
+                
+                # Strict rules integrated directly from 'Prior Uptrend'
+                cond_prior_uptrend = (curr["SMA_200_Slope"] > 0) and (curr["Distance_From_Low_52W"] >= 0.30) and (curr["Bull_Trend_Days"] >= 20)
+                
+                cond_rs = curr["ROC_20"] > nifty_roc20
+                cond_mom = curr["ROC_3M"] >= 35.0
+                cond_90d_bounce = curr["Gain_From_Low_90"] > 0.40
+
+                if not (cond_trend and cond_slope and cond_prior_uptrend and cond_rs and cond_mom and cond_90d_bounce):
+                    continue
+
+                cond_highs = curr["Distance_From_High"] <= 0.18
+                cond_comp = (curr["EMA_Distance_Pct"] <= 7.0) or (curr["ROC_3M"] >= 80.0)
+                cond_dcr = curr["DCR"] >= 75.0
+                cond_vol = curr["Vol_Ratio"] >= 1.8
+
+                if cond_highs and cond_comp and cond_dcr and cond_vol:
+                    actionable_signals.append({
+                        "ticker": ticker,
+                        "price": curr["Close"],
+                        "stop_loss": curr["Close"] * (1 - STOP_LOSS_PCT),
+                        "vol_ratio": curr["Vol_Ratio"],
+                        "dcr": curr["DCR"],
+                        "roc_3m": curr["ROC_3M"],
+                        "rs_spread": curr["ROC_20"] - nifty_roc20,
+                        "dist_high": curr["Distance_From_High"] * 100,
+                    })
+                    continue
+
+                cond_radar_proximity = (curr["Distance_From_High"] <= 0.08) and (curr["EMA_Distance_Pct"] <= 10.0)
+                cond_radar_activity = (curr["Vol_Ratio"] >= 1.2) or (curr["DCR"] >= 65.0)
+
+                if cond_radar_proximity and cond_radar_activity:
+                    radar_watchlist.append({
+                        "ticker": ticker,
+                        "price": curr["Close"],
+                        "vol_ratio": curr["Vol_Ratio"],
+                        "dcr": curr["DCR"],
+                        "dist_high": curr["Distance_From_High"] * 100,
+                        "roc_3m": curr["ROC_3M"],
+                    })
+
+            # =====================================================================
+            # SCENARIO B: BEAR REGIME (Study Only - Pure RS Pulse Check)
+            # =====================================================================
+            else:
+                if not pd.isna(curr["ROC_20"]):
+                    dist_high_val = curr["Distance_From_High"] * 100 if not pd.isna(curr["Distance_From_High"]) else 0.0
+                    bear_rs_watchlist.append({
+                        "ticker": ticker,
+                        "price": curr["Close"],
+                        "rs_spread": curr["ROC_20"] - nifty_roc20,
+                        "dist_high": dist_high_val,
+                    })
+
+        except Exception as e:
+            error_count += 1
+            print(f"Error processing {ticker}: {e}")
+            continue
 
 conn.close()
 
 # =====================================================================
 # 3. CONSTRUCT TELEGRAM DISPATCH
 # =====================================================================
-msg_lines = [f"**🎯 DAILY SYSTEM SCANNER REPORT ({today_str})**"]
-msg_lines.append(f"*Diag: {len(tables)} DB Tables | {processed_count} Evaluated | {skipped_liquidity_count} Low Liq | {error_count} Errors*\n")
+msg_lines = [f"<b>🎯 DAILY SYSTEM SCANNER REPORT ({today_str})</b>"]
+msg_lines.append(f"<i>Diag: {len(tables)} DB Tables | {processed_count} Evaluated | {skipped_liquidity_count} Low Liq | {error_count} Errors</i>\n")
 
 if is_macro_bull:
-    msg_lines.append(f"**Macro Regime:** 🟢 BULLISH (Nifty: {nifty_close:.1f} | 20D ROC: {nifty_roc20:.1f}%)")
+    msg_lines.append(f"<b>Macro Regime:</b> 🟢 BULLISH (Nifty: {nifty_close:.1f} | 20D ROC: {nifty_roc20:.1f}%)")
 else:
-    msg_lines.append(f"**Macro Regime:** 🔴 BEARISH / CAUTION (Nifty: {nifty_close:.1f})")
-    msg_lines.append("**⚠️ MACRO SHIELD DOWN:** Standard setups blocked. Hunting Extreme RS Anomalies for study.")
+    msg_lines.append(f"<b>Macro Regime:</b> 🔴 BEARISH / CAUTION (Nifty: {nifty_close:.1f})")
+    msg_lines.append("<b>⚠️ MACRO SHIELD DOWN:</b> Standard setups blocked. Hunting Extreme RS Anomalies for study.")
 
 msg_lines.append("=" * 35)
 
 if actionable_signals and is_macro_bull:
-    msg_lines.append("\n**🚀 ACTIONABLE TRANCHE-1 PROBES:**")
-    msg_lines.append("*Allocation: 33% of 25% Position | Stop-Loss: 8%*\n")
+    msg_lines.append("\n<b>🚀 ACTIONABLE TRANCHE-1 PROBES:</b>")
+    msg_lines.append("<i>Allocation: 33% of 25% Position | Stop-Loss: 8%</i>\n")
     for sig in actionable_signals:
-        msg_lines.append(f"• **{sig['ticker']}** @ ₹{sig['price']:.2f}")
-        msg_lines.append(f"  ├ 🛑 **Initial Stop-Loss:** ₹{sig['stop_loss']:.2f} (-8.0%)")
-        msg_lines.append(f"  ├ 📈 **3M Momentum:** +{sig['roc_3m']:.1f}% | **RS vs Nifty:** +{sig['rs_spread']:.1f}%")
-        msg_lines.append(f"  ├ 📊 **Volume Surge:** {sig['vol_ratio']:.2f}x | **Closing Range (DCR):** {sig['dcr']:.1f}%")
-        msg_lines.append(f"  └ 🎯 **Distance from 52W High:** {sig['dist_high']:.1f}%\n")
+        msg_lines.append(f"• <b>{sig['ticker']}</b> @ ₹{sig['price']:.2f}")
+        msg_lines.append(f"  ├ 🛑 <b>Initial Stop-Loss:</b> ₹{sig['stop_loss']:.2f} (-8.0%)")
+        msg_lines.append(f"  ├ 📈 <b>3M Momentum:</b> +{sig['roc_3m']:.1f}% | <b>RS vs Nifty:</b> +{sig['rs_spread']:.1f}%")
+        msg_lines.append(f"  ├ 📊 <b>Volume Surge:</b> {sig['vol_ratio']:.2f}x | <b>Closing Range (DCR):</b> {sig['dcr']:.1f}%")
+        msg_lines.append(f"  └ 🎯 <b>Distance from 52W High:</b> {sig['dist_high']:.1f}%\n")
 elif is_macro_bull:
-    msg_lines.append("\n**🚀 ACTIONABLE TRANCHE-1 PROBES:** None today.")
+    msg_lines.append("\n<b>🚀 ACTIONABLE TRANCHE-1 PROBES:</b> None today.")
 
 if radar_watchlist and is_macro_bull:
-    msg_lines.append("\n**👀 RADAR WATCHLIST (NEARING BREAKOUT):**")
+    msg_lines.append("\n<b>👀 RADAR WATCHLIST (NEARING BREAKOUT):</b>")
     for r in radar_watchlist[:8]:
-        msg_lines.append(f"• **{r['ticker']}** (₹{r['price']:.2f}) | High Gap: -{r['dist_high']:.1f}% | Vol: {r['vol_ratio']:.1f}x | DCR: {r['dcr']:.0f}%")
+        msg_lines.append(f"• <b>{r['ticker']}</b> (₹{r['price']:.2f}) | High Gap: -{r['dist_high']:.1f}% | Vol: {r['vol_ratio']:.1f}x | DCR: {r['dcr']:.0f}%")
 
 if not is_macro_bull and bear_rs_watchlist:
-    msg_lines.append("\n**🛡️ PURE RS PULSE CHECK (STUDY ONLY):**")
-    msg_lines.append("*Top 15 stocks showing relative strength vs Nifty:*\n")
+    msg_lines.append("\n<b>🛡️ PURE RS PULSE CHECK (STUDY ONLY):</b>")
+    msg_lines.append("<i>Top 15 stocks showing relative strength vs Nifty:</i>\n")
     
     bear_rs_watchlist = sorted(bear_rs_watchlist, key=lambda x: x["rs_spread"], reverse=True)
     
     for r in bear_rs_watchlist[:15]: 
-        msg_lines.append(f"• **{r['ticker']}** (₹{r['price']:.2f})")
-        msg_lines.append(f"  └ **RS Outperformance:** +{r['rs_spread']:.1f}% | High Gap: -{r['dist_high']:.1f}%")
+        msg_lines.append(f"• <b>{r['ticker']}</b> (₹{r['price']:.2f})")
+        msg_lines.append(f"  └ <b>RS Outperformance:</b> +{r['rs_spread']:.1f}% | High Gap: -{r['dist_high']:.1f}%")
 elif not is_macro_bull:
-    msg_lines.append("\n**🛡️ PURE RS PULSE CHECK:** No data available.")
+    msg_lines.append("\n<b>🛡️ PURE RS PULSE CHECK:</b> No data available.")
 
 final_message = "\n".join(msg_lines)
 send_telegram_alert(final_message)
