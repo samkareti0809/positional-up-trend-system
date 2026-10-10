@@ -20,7 +20,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 MAX_HISTORY_DAYS = 350             
 MIN_DAILY_TURNOVER_INR = 30000000  
 STOP_LOSS_PCT = 0.08               
-BATCH_SIZE = 200 # Defines how many stocks to fetch simultaneously
+BATCH_SIZE = 200 # Multi-threading batch size
 
 def send_telegram_alert(message: str):
     """Dispatches formatted message to Telegram."""
@@ -73,13 +73,67 @@ print(f"Nifty 50: {nifty_close:.2f} | 50 EMA: {nifty_ema50:.2f} | 200 SMA: {nift
 print(f"Macro Shield Status: {'BULLISH (ACTIVE)' if is_macro_bull else 'BEARISH (WARNING)'}")
 
 # =====================================================================
-# 2. BATCH DATA SYNC & SYSTEM SCANNER
+# 2. DATABASE CONNECTION & ON-THE-GO BOOTSTRAP
 # =====================================================================
 conn = sqlite3.connect(DB_NAME)
 cursor = conn.cursor()
 cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'stock_%';")
 tables = [row[0] for row in cursor.fetchall()]
 
+# --- DYNAMIC BOOTSTRAP: If DB is empty, read seed file and build it ---
+if len(tables) == 0:
+    print("Empty database detected! Initiating On-The-Go Bootstrap Protocol...")
+    if os.path.exists("EQUITY_L.csv"):
+        df_sym = pd.read_csv("EQUITY_L.csv")
+        tickers = [f"{sym}.NS" for sym in df_sym['SYMBOL']]
+        print(f"Found {len(tickers)} stocks in EQUITY_L.csv. Downloading 1-year history in batches. This will take ~2 minutes...")
+        
+        for i in range(0, len(tickers), BATCH_SIZE):
+            batch_tickers = tickers[i:i+BATCH_SIZE]
+            print(f"Bootstrapping Batch {i//BATCH_SIZE + 1} of {(len(tickers)//BATCH_SIZE) + 1}...")
+            try:
+                batch_data = yf.download(
+                    batch_tickers, 
+                    period="1y", 
+                    interval="1d", 
+                    group_by="ticker", 
+                    threads=True, 
+                    progress=False, 
+                    auto_adjust=False
+                )
+                
+                for ticker in batch_tickers:
+                    if len(batch_tickers) > 1:
+                        if ticker not in batch_data.columns.get_level_values(0): continue
+                        df_new = batch_data[ticker].copy()
+                    else:
+                        df_new = batch_data.copy()
+                        
+                    df_new.dropna(subset=["Close"], inplace=True)
+                    if df_new.empty or len(df_new) < 60: 
+                        continue
+                        
+                    df_new.reset_index(inplace=True)
+                    date_col = "Date" if "Date" in df_new.columns else df_new.columns[0]
+                    df_new["Date"] = pd.to_datetime(df_new[date_col]).dt.normalize()
+                    df_new.columns = [str(c).strip() for c in df_new.columns]
+                    
+                    table_name = f"stock_{ticker.replace('.NS', '_NS')}"
+                    df_new = df_new[["Date", "Open", "High", "Low", "Close", "Volume"]]
+                    df_new.to_sql(table_name, conn, if_exists="replace", index=False)
+                    
+            except Exception as e:
+                print(f"Bootstrap batch failed: {e}")
+                
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'stock_%';")
+        tables = [row[0] for row in cursor.fetchall()]
+        print(f"Bootstrap complete! {len(tables)} stocks populated successfully.")
+    else:
+        print("ERROR: EQUITY_L.csv seed file is missing. Please upload it via the GitHub website.")
+
+# =====================================================================
+# 3. BATCH DATA SYNC & SYSTEM SCANNER
+# =====================================================================
 actionable_signals = []
 radar_watchlist = []
 bear_rs_watchlist = []
@@ -88,15 +142,14 @@ processed_count = 0
 error_count = 0
 skipped_liquidity_count = 0
 
-print(f"Syncing and evaluating {len(tables)} stocks in batches of {BATCH_SIZE}...")
+if len(tables) > 0:
+    print(f"\nInitiating daily scanner for {len(tables)} stocks...")
 
 for i in range(0, len(tables), BATCH_SIZE):
     batch_tables = tables[i:i + BATCH_SIZE]
     batch_tickers = [t.replace("stock_", "").replace("_NS", ".NS") for t in batch_tables]
     
-    print(f"Processing Batch {i//BATCH_SIZE + 1} of {(len(tables)//BATCH_SIZE) + 1}...")
-    
-    # 2a. Fetch 7 days of rolling data for the entire batch instantly
+    # Fetch latest 7 days for the batch instantly
     try:
         batch_data = yf.download(
             batch_tickers, 
@@ -107,18 +160,16 @@ for i in range(0, len(tables), BATCH_SIZE):
             progress=False, 
             auto_adjust=False
         )
-    except Exception as e:
-        print(f"Batch fetch failed: {e}")
+    except Exception:
         error_count += len(batch_tickers)
         continue
 
-    # 2b. Update Database and Run Scan per Ticker in the Batch
+    # Update Database and Run Scan per Ticker
     for table, ticker in zip(batch_tables, batch_tickers):
         try:
-            # --- EXTRACT BATCH DATA FOR CURRENT TICKER ---
+            # --- UPDATE INCREMENTAL DATA ---
             if len(batch_tickers) > 1:
-                if ticker not in batch_data.columns.get_level_values(0):
-                    continue
+                if ticker not in batch_data.columns.get_level_values(0): continue
                 df_new = batch_data[ticker].copy()
             else:
                 df_new = batch_data.copy()
@@ -131,7 +182,6 @@ for i in range(0, len(tables), BATCH_SIZE):
                 df_new["Date"] = pd.to_datetime(df_new[date_col]).dt.normalize()
                 df_new.columns = [str(c).strip() for c in df_new.columns]
                 
-                # Fetch max date directly via SQL to avoid loading full history into memory yet
                 cursor.execute(f"SELECT MAX(Date) FROM {table}")
                 max_date_val = cursor.fetchone()[0]
                 
@@ -139,12 +189,11 @@ for i in range(0, len(tables), BATCH_SIZE):
                     max_date = pd.to_datetime(max_date_val).normalize()
                     df_new = df_new[df_new["Date"] > max_date]
                 
-                # Append missing days
                 if not df_new.empty:
                     df_new = df_new[["Date", "Open", "High", "Low", "Close", "Volume"]]
                     df_new.to_sql(table, conn, if_exists="append", index=False)
             
-            # Keep database lean
+            # Truncate rolling database to max history
             conn.execute(f"""
                 DELETE FROM {table} 
                 WHERE rowid NOT IN (
@@ -153,7 +202,7 @@ for i in range(0, len(tables), BATCH_SIZE):
             """)
             conn.commit()
 
-            # --- LOAD FULL CACHE & RUN SCANNER LOGIC ---
+            # --- LOAD CACHE & RUN SCANNER LOGIC ---
             df = pd.read_sql(f"SELECT * FROM {table} ORDER BY Date ASC", conn)
             if df.empty:
                 continue
@@ -173,7 +222,7 @@ for i in range(0, len(tables), BATCH_SIZE):
                 skipped_liquidity_count += 1
                 continue
 
-            # Indicator Calculations 
+            # Indicators 
             df["EMA_50"] = df["Close"].ewm(span=50, adjust=False).mean()
             df["EMA_50_Slope"] = df["EMA_50"] - df["EMA_50"].shift(20)
             df["SMA_200"] = df["Close"].rolling(window=200, min_periods=60).mean()
@@ -208,7 +257,7 @@ for i in range(0, len(tables), BATCH_SIZE):
                 cond_trend = (curr["Close"] > curr["EMA_50"]) and (curr["EMA_50"] > curr["SMA_200"])
                 cond_slope = curr["EMA_50_Slope"] > 0
                 
-                # Strict rules integrated directly from 'Prior Uptrend'
+                # Strict structural rules integrated directly from "Prior Uptrend " file
                 cond_prior_uptrend = (curr["SMA_200_Slope"] > 0) and (curr["Distance_From_Low_52W"] >= 0.30) and (curr["Bull_Trend_Days"] >= 20)
                 
                 cond_rs = curr["ROC_20"] > nifty_roc20
@@ -270,7 +319,7 @@ for i in range(0, len(tables), BATCH_SIZE):
 conn.close()
 
 # =====================================================================
-# 3. CONSTRUCT TELEGRAM DISPATCH
+# 4. CONSTRUCT TELEGRAM DISPATCH
 # =====================================================================
 msg_lines = [f"<b>🎯 DAILY SYSTEM SCANNER REPORT ({today_str})</b>"]
 msg_lines.append(f"<i>Diag: {len(tables)} DB Tables | {processed_count} Evaluated | {skipped_liquidity_count} Low Liq | {error_count} Errors</i>\n")
