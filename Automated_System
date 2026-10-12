@@ -238,4 +238,4 @@ if __name__ == "__main__":
         # For demonstration, we'll run both sequentially right now:
         print("\n--- DEMONSTRATION RUN ---")
         run_eod_screener()
-        run_intraday_scanner()
+        run_intraday_scanner().
